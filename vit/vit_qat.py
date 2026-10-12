@@ -89,6 +89,12 @@ if str(_COMMON_PATH) not in sys.path:
     sys.path.insert(0, str(_COMMON_PATH))
 from loss import dice_loss, dice_coef_metric
 
+# Import the BF16-simulated NVFP4 runtime (recipe 1 implementation).
+_REPO_ROOT = Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from nvfp4_sim import nvfp4_qdq
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MODEL CONFIGURATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -337,7 +343,7 @@ SUPPORTED_RECIPES = {
 # PUBLIC NVFP4 QAT RUNTIME COMPATIBILITY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_QAT_RUNTIME_AVAILABLE = False
+_QAT_RUNTIME_AVAILABLE = True  # recipe 1: BF16-simulated NVFP4 runtime (nvfp4_sim.py)
 _QAT_RUNTIME_ADVANCED_AVAILABLE = False
 _QAT_RUNTIME_QUIET = os.environ.get("QAT_RUNTIME_QUIET", "0") == "1"
 
@@ -416,35 +422,83 @@ class NVFPQuantizer:
         self.last_w_mse = None
         self.last_g_mse = None
 
-        if self.enabled:
+        # Only recipe 1 (NVFP4 Full) has a working BF16-simulated runtime here.
+        if self.enabled and recipe_id != 1:
             check_qat_runtime_available()
 
     def quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
-        if self.enabled:
-            check_qat_runtime_available()
-        return x
+        """Simulated NVFP4 QDQ along the feature (K) axis."""
+        if not self.enabled:
+            return x
+        return nvfp4_qdq(x, axis=-1)
 
     def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
-        if self.enabled:
-            check_qat_runtime_available()
-        return w
+        """Simulated NVFP4 QDQ of a (N, K) weight along its K axis."""
+        if not self.enabled:
+            return w
+        return nvfp4_qdq(w, axis=-1)
 
     def quantize_gradient(self, g: torch.Tensor) -> torch.Tensor:
-        if self.enabled:
-            check_qat_runtime_available()
-        return g
+        """Simulated NVFP4 QDQ of a gradient tensor along its last axis."""
+        if not self.enabled:
+            return g
+        return nvfp4_qdq(g, axis=-1)
 
 
 class QuantizedLinearFunction(torch.autograd.Function):
-    """Public placeholder for the omitted NVFP4 Linear QAT path."""
+    """Linear layer with NVFP4-quantized operands (BF16-simulated).
+
+    Recipe 1 (NVFP4 Full): every GEMM operand is quantized.
+
+      Forward : Y  = Q_K(X) @ Q_K(W)^T + b          (blocks along K)
+      DGRAD   : dX = Q_N(G) @ Q_N(W)                (blocks along N)
+      WGRAD   : dW = Q_M(G)^T @ Q_M(X)              (blocks along M)
+
+    The originals (X, W) are saved so the backward can re-quantize them along
+    the reduction axis of each backward GEMM; with 1-D block scaling,
+    Q(W^T) != Q(W)^T, so reusing the forward-quantized weights would change
+    the experiment semantics.
+    """
 
     @staticmethod
-    def forward(ctx, *args, **kwargs):
-        check_qat_runtime_available()
+    def forward(ctx, x, weight, bias, quantizer):
+        if quantizer is None or not quantizer.enabled:
+            return F.linear(x, weight, bias)
+        if quantizer.recipe_id != 1:
+            check_qat_runtime_available()
+
+        x_hat = quantizer.quantize_activation(x)
+        w_hat = quantizer.quantize_weight(weight)
+        out = F.linear(x_hat, w_hat, bias)
+
+        ctx.save_for_backward(x, weight, bias)
+        ctx.quantizer = quantizer
+        return out
 
     @staticmethod
-    def backward(ctx, *grad_outputs):
-        check_qat_runtime_available()
+    def backward(ctx, grad_out):
+        x, weight, bias = ctx.saved_tensors
+        quantizer = ctx.quantizer
+        if quantizer is None or not quantizer.enabled:
+            return grad_out @ weight, grad_out.reshape(-1, grad_out.shape[-1]).t() @ x.reshape(-1, x.shape[-1]), (grad_out.sum(dim=tuple(range(grad_out.dim() - 1))) if bias is not None else None), None
+
+        g = grad_out.contiguous()
+        g2d = g.reshape(-1, g.shape[-1])          # (M, N)
+        x2d = x.reshape(-1, x.shape[-1])          # (M, K)
+        dtype = grad_out.dtype
+
+        # DGRAD: contraction over N -> quantize G along N, W along N (axis 0).
+        g_hat = quantizer.quantize_gradient(g2d).to(dtype)
+        w_bk = nvfp4_qdq(weight, axis=0).to(dtype)
+        dX = (g_hat @ w_bk).reshape(x.shape)
+
+        # WGRAD: contraction over M -> quantize G^T along M, X along M.
+        gt_hat = quantizer.quantize_gradient(g2d.t().contiguous()).to(dtype)
+        xt_hat = nvfp4_qdq(x2d, axis=0).to(dtype)
+        dW = gt_hat @ xt_hat
+
+        dB = g2d.sum(dim=0) if bias is not None else None
+        return dX.to(x.dtype), dW.to(weight.dtype), dB, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

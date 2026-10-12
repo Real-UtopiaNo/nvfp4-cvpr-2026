@@ -1209,7 +1209,7 @@ def train_single_recipe(
     else:  # "adamw" (default)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = torch.amp.GradScaler('cuda', enabled=False)
     
     # QAD parameters
     qad_task_weight = qad_params.get("task_weight", 1.0) if qad_params else 1.0
@@ -1259,7 +1259,7 @@ def train_single_recipe(
             images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad()
             
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 logits = model(images)
                 loss, loss_components = compute_qat_qad_loss(
                     logits, masks, loss_type,
@@ -1316,7 +1316,7 @@ def train_single_recipe(
         with torch.no_grad():
             for images, masks in val_dataloader:
                 images, masks = images.to(device), masks.to(device)
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     logits = model(images)
                     # Compute validation loss (same loss function as training)
                     _, val_loss_components = compute_qat_qad_loss(
@@ -2273,7 +2273,9 @@ def run_validation_inference(
         for images, masks in val_dataloader:
             images = images.to(device)
             
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(
+                'cuda', dtype=torch.bfloat16, enabled=use_amp
+            ):
                 logits = model(images)
             
             probs_batch = torch.sigmoid(logits.float()).cpu()
