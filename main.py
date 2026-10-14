@@ -109,11 +109,13 @@ except ImportError as e:
     print(f"Swin not available: {e}")
 
 HAS_VIT = False
+IMPLEMENTED_QAT_RECIPES = set()
 try:
     from vit_qat import (
         create_vit_qat, SUPPORTED_RECIPES as VIT_RECIPES,
         _QAT_RUNTIME_AVAILABLE as _VIT_QAT_RUNTIME,
         _QAT_RUNTIME_ADVANCED_AVAILABLE as _VIT_QAT_RUNTIME_ADV,
+        IMPLEMENTED_QAT_RECIPES,
     )
     HAS_VIT = True
 except ImportError as e:
@@ -204,6 +206,8 @@ def can_run_recipe(arch_name: str, recipe_id: int) -> bool:
     if not cfg["qat_runtime"]():
         return False
     if recipe_id in ADVANCED_QAT_RECIPES and not cfg["qat_runtime_adv"]():
+        return False
+    if recipe_id not in IMPLEMENTED_QAT_RECIPES:
         return False
     return True
 

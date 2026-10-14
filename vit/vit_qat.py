@@ -343,8 +343,12 @@ SUPPORTED_RECIPES = {
 # PUBLIC NVFP4 QAT RUNTIME COMPATIBILITY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_QAT_RUNTIME_AVAILABLE = True  # recipe 1: BF16-simulated NVFP4 runtime (nvfp4_sim.py)
-_QAT_RUNTIME_ADVANCED_AVAILABLE = False
+_QAT_RUNTIME_AVAILABLE = True  # BF16-simulated NVFP4 runtime (nvfp4_sim.py)
+_QAT_RUNTIME_ADVANCED_AVAILABLE = True  # advanced flag on; per-recipe gating below
+
+# Recipes with a working BF16-simulated implementation in this repo.
+# Used by main.can_run_recipe so dry-run only advertises runnable recipes.
+IMPLEMENTED_QAT_RECIPES = {1, 2, 6}
 _QAT_RUNTIME_QUIET = os.environ.get("QAT_RUNTIME_QUIET", "0") == "1"
 
 PUBLIC_QAT_RUNTIME_MESSAGE = (
@@ -422,8 +426,9 @@ class NVFPQuantizer:
         self.last_w_mse = None
         self.last_g_mse = None
 
-        # Only recipe 1 (NVFP4 Full) has a working BF16-simulated runtime here.
-        if self.enabled and recipe_id != 1:
+        # Recipes 1 (NVFP4 Full), 2 (Forward-Only) and 6 (SR Only) have a
+        # working BF16-simulated runtime here; other recipes remain gated.
+        if self.enabled and recipe_id not in (1, 2, 6):
             check_qat_runtime_available()
 
     def quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
@@ -439,10 +444,14 @@ class NVFPQuantizer:
         return nvfp4_qdq(w, axis=-1)
 
     def quantize_gradient(self, g: torch.Tensor) -> torch.Tensor:
-        """Simulated NVFP4 QDQ of a gradient tensor along its last axis."""
+        """Simulated NVFP4 QDQ of a gradient tensor along its last axis.
+
+        Recipes with has_sr (5, 6) use stochastic rounding for the E2M1
+        conversion; all other recipes use deterministic rounding.
+        """
         if not self.enabled:
             return g
-        return nvfp4_qdq(g, axis=-1)
+        return nvfp4_qdq(g, axis=-1, sr=self.has_sr)
 
 
 class QuantizedLinearFunction(torch.autograd.Function):
@@ -454,6 +463,10 @@ class QuantizedLinearFunction(torch.autograd.Function):
       DGRAD   : dX = Q_N(G) @ Q_N(W)                (blocks along N)
       WGRAD   : dW = Q_M(G)^T @ Q_M(X)              (blocks along M)
 
+    Recipe 2 (Forward-Only): same quantized forward, but the backward is the
+    plain BF16 backward with the original W, X and unquantized G (STE-like):
+    dX = G @ W, dW = G^T @ X.
+
     The originals (X, W) are saved so the backward can re-quantize them along
     the reduction axis of each backward GEMM; with 1-D block scaling,
     Q(W^T) != Q(W)^T, so reusing the forward-quantized weights would change
@@ -464,7 +477,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
     def forward(ctx, x, weight, bias, quantizer):
         if quantizer is None or not quantizer.enabled:
             return F.linear(x, weight, bias)
-        if quantizer.recipe_id != 1:
+        if quantizer.recipe_id not in (1, 2, 6):
             check_qat_runtime_available()
 
         x_hat = quantizer.quantize_activation(x)
@@ -486,6 +499,14 @@ class QuantizedLinearFunction(torch.autograd.Function):
         g2d = g.reshape(-1, g.shape[-1])          # (M, N)
         x2d = x.reshape(-1, x.shape[-1])          # (M, K)
         dtype = grad_out.dtype
+
+        if quantizer.forward_only:
+            # Recipe 2 (Forward-Only): quantized forward, plain BF16 backward
+            # using the ORIGINAL W, X and the unquantized upstream gradient.
+            dX = (g2d @ weight.to(dtype)).reshape(x.shape)
+            dW = g2d.t() @ x2d.to(dtype)
+            dB = g2d.sum(dim=0) if bias is not None else None
+            return dX.to(x.dtype), dW.to(weight.dtype), dB, None
 
         # DGRAD: contraction over N -> quantize G along N, W along N (axis 0).
         g_hat = quantizer.quantize_gradient(g2d).to(dtype)

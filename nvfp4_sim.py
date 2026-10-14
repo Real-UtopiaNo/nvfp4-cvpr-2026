@@ -42,16 +42,32 @@ E4M3_MIN_SUBNORMAL = 2.0 ** -9
 BLOCK = 16
 
 
-def round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
-    """Round a float tensor to the nearest E2M1-representable value (saturating).
+def round_to_e2m1(x: torch.Tensor, stochastic: bool = False) -> torch.Tensor:
+    """Round a float tensor to E2M1-representable values (saturating at +-6).
 
-    Ties at grid midpoints round up (bucketize default). Values with |x| >= 5
-    saturate at +-6.
+    Deterministic mode: round-to-nearest; ties at grid midpoints round up
+    (bucketize default). Values with |x| >= 5 saturate at +-6.
+
+    Stochastic mode (SR): each magnitude rounds to one of the two adjacent
+    grid points l <= |x| <= u, choosing u with probability (|x| - l)/(u - l).
+    This makes quantization unbiased at the grid level: E[SR(x)] = x.
+    Exact grid points and saturation are preserved.
     """
     grid = torch.tensor(E2M1_VALUES, device=x.device, dtype=x.dtype)
-    mids = (grid[1:] + grid[:-1]) / 2.0  # [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
-    idx = torch.bucketize(x.abs().clamp(max=E2M1_MAX), mids)
-    return x.sign() * grid[idx]
+    ax = x.abs().clamp(max=E2M1_MAX)
+
+    if not stochastic:
+        mids = (grid[1:] + grid[:-1]) / 2.0  # [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
+        idx = torch.bucketize(ax, mids)
+        return x.sign() * grid[idx]
+
+    idx_u = torch.bucketize(ax, grid, right=True).clamp(max=len(E2M1_VALUES) - 1)
+    idx_l = (idx_u - 1).clamp(min=0)
+    u = grid[idx_u]
+    l = grid[idx_l]
+    p = ((ax - l) / (u - l).clamp(min=1e-12)).clamp(0.0, 1.0)
+    mag = torch.where(torch.rand_like(ax) < p, u, l)
+    return x.sign() * mag
 
 
 def _cast_e4m3(s: torch.Tensor) -> torch.Tensor:
@@ -61,12 +77,16 @@ def _cast_e4m3(s: torch.Tensor) -> torch.Tensor:
     return s.clamp(min=E4M3_MIN_SUBNORMAL)
 
 
-def nvfp4_qdq(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
+def nvfp4_qdq(x: torch.Tensor, axis: int = -1, sr: bool = False) -> torch.Tensor:
     """Simulated NVFP4 quantize-dequantize.
 
     Quantizes `x` along `axis` in blocks of 16 elements using per-block E4M3
     scales and a per-tensor FP32 scale, then dequantizes back to `x.dtype`.
     The returned tensor has the same shape and dtype as the input.
+
+    With sr=True, only the E2M1 value rounding uses stochastic rounding
+    (used for gradient quantization in the "SR Only" recipe); block scales
+    and the global scale remain deterministic.
     """
     if not x.is_floating_point():
         raise TypeError(f"nvfp4_qdq expects a float tensor, got {x.dtype}")
@@ -95,7 +115,7 @@ def nvfp4_qdq(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
 
     # Quantize to the E2M1 grid and dequantize.
     scaled = blocks / (block_scale * global_scale)
-    q = round_to_e2m1(scaled)
+    q = round_to_e2m1(scaled, stochastic=sr)
     deq = q * block_scale * global_scale
 
     deq = deq.reshape(*lead_shape, k + pad)
@@ -163,6 +183,21 @@ def _self_test() -> None:
     out_e = nvfp4_qdq(xe)
     assert torch.isfinite(out_e).all()
     print("  [ok] extreme amax edge case")
+
+    # 8) stochastic rounding: on-grid values, two draws differ, mean unbiased
+    xs = torch.randn(512, 64)
+    s1 = nvfp4_qdq(xs, sr=True)
+    s2 = nvfp4_qdq(xs, sr=True)
+    assert torch.isfinite(s1).all() and torch.isfinite(s2).all()
+    assert not torch.equal(s1, s2), "SR draws should differ"
+    acc = torch.zeros_like(xs)
+    n = 200
+    for _ in range(n):
+        acc += nvfp4_qdq(xs, sr=True).float()
+    bias = ((acc / n) - xs).abs().mean().item()
+    scale = xs.abs().mean().item()
+    assert bias < 0.02 * scale + 1e-3, f"SR bias too large: {bias} (scale {scale})"
+    print(f"  [ok] stochastic rounding: mean bias {bias:.2e} over {n} draws")
 
     print("all self tests passed")
 
