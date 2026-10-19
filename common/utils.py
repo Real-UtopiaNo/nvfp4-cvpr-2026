@@ -241,7 +241,12 @@ RECIPE_COLORS = {
     0:     "#3498db",  # Blue - Baseline
     1:  "#e74c3c",  # Red - Full NVFP4
     60031: "#c0392b",  # Dark Red - NVFP4 Full (Skip Bottleneck)
-    8:  "#9b59b6",  # Purple - Autograd
+    8:  "#9b59b6",  # Purple - PTQ (RTN)
+    9:  "#7f8c8d",  # Gray - INT4 PTQ per-channel/per-token
+    10: "#d35400",  # Pumpkin - INT4 PTQ group-16
+    11: "#5b2c6f",  # Dark Purple - NVFP4 PTQ, all weighted layers
+    12: "#7b241c",  # Maroon - NVFP4 Full, all weighted layers
+    13: "#27ae60",  # Green - NVFP4 QAT (fine-tuned Baseline, forward-only fake quant)
     4:  "#2ecc71",  # Green - 2D + RHT
     5:  "#f39c12",  # Orange - 2D + RHT + SR
     6:  "#1abc9c",  # Teal - SR Only
@@ -254,7 +259,12 @@ RECIPE_NAMES = {
     0:     "Baseline",
     1:  "NVFP4 Full",
     60031: "NVFP4 Full (Skip Bottleneck)",
-    8:  "Autograd",
+    8:  "NVFP4 PTQ (RTN)",
+    9:  "INT4 PTQ (ch/tok)",
+    10: "INT4 PTQ (g16)",
+    11: "NVFP4 PTQ (all layers)",
+    12: "NVFP4 Full (all layers)",
+    13: "NVFP4 QAT",
     4:  "2D+RHT",
     5:  "2D+RHT+SR",
     6:  "SR Only",
@@ -1165,6 +1175,8 @@ def train_single_recipe(
     early_stopping_metric: str = "loss",  # "loss", "f2", "recall", or "dice"
     early_stopping_min_delta: float = 0.001,
     early_stopping_warmup: int = 0,  # Disable early stopping for first N epochs
+    amp_dtype: str = "fp16",  # "fp16" (with GradScaler) or "bf16" (no loss scaling)
+    train_epochs: Optional[int] = None,  # epochs actually run; num_epochs still names the files
 ) -> Dict[str, Any]:
     """
     Train a single recipe and return results.
@@ -1193,11 +1205,13 @@ def train_single_recipe(
         early_stopping_metric: Metric to monitor - "loss", "f2", "recall", or "dice" (default: "loss")
         early_stopping_warmup: Disable early stopping for first N epochs (default: 0)
         early_stopping_min_delta: Minimum improvement to reset patience (default: 0.001)
+        amp_dtype: Autocast dtype for the whole model, "fp16" (default) or "bf16"
         
     Returns:
         Results dictionary with history, metrics, probabilities
     """
     recipe_name = RECIPE_NAMES.get(recipe_id, f"Recipe {recipe_id}")
+    autocast_dtype = AMP_DTYPES[amp_dtype]
     
     # Create and initialize model
     model = create_model_fn(model_size=model_size, recipe_id=recipe_id).to(device)
@@ -1209,7 +1223,9 @@ def train_single_recipe(
     else:  # "adamw" (default)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
-    scaler = torch.amp.GradScaler('cuda')
+    # BF16 has FP32's exponent range, so loss scaling is unnecessary; a disabled
+    # scaler makes scale/unscale_/update no-ops and step() a plain optimizer.step().
+    scaler = torch.amp.GradScaler('cuda', enabled=(amp_dtype == "fp16"))
     
     # QAD parameters
     qad_task_weight = qad_params.get("task_weight", 1.0) if qad_params else 1.0
@@ -1239,15 +1255,16 @@ def train_single_recipe(
     
     # Log file (include kld weight for QAD)
     kld_suffix = f"_kld{qad_distill_weight}" if "qad" in loss_type else ""
-    log_path = ckpt_dir / f"recipe_{recipe_id}_{model_size}_{num_epochs}ep_{loss_type}{kld_suffix}.txt"
+    amp_suffix = f"_{amp_dtype}" if amp_dtype != "fp16" else ""
+    log_path = ckpt_dir / f"recipe_{recipe_id}_{model_size}_{num_epochs}ep_{loss_type}{kld_suffix}{amp_suffix}.txt"
     with open(log_path, "w") as f:
-        f.write(f"Recipe {recipe_id} ({recipe_name}) - {loss_type.upper()}\n")
+        f.write(f"Recipe {recipe_id} ({recipe_name}) - {loss_type.upper()} - AMP {amp_dtype}\n")
         f.write(f"Model: {model_size}, Max Epochs: {num_epochs}, KLD Weight: {qad_distill_weight if 'qad' in loss_type else 'N/A'}\n")
         f.write(f"Early Stopping: metric={early_stopping_metric}, patience={early_stopping_patience}, min_delta={early_stopping_min_delta}\n")
         f.write("=" * 90 + "\n")
         f.write("Epoch,BCE,Dice,Tversky,KLD,Total,TrainDice,ValDice,ValF2,ValRecall,GradNorm,EpochTime\n")
     
-    for epoch in range(num_epochs):
+    for epoch in range(train_epochs or num_epochs):
         epoch_start = time.time()
         model.train()
         
@@ -1259,7 +1276,7 @@ def train_single_recipe(
             images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad()
             
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', dtype=autocast_dtype):
                 logits = model(images)
                 loss, loss_components = compute_qat_qad_loss(
                     logits, masks, loss_type,
@@ -1316,7 +1333,7 @@ def train_single_recipe(
         with torch.no_grad():
             for images, masks in val_dataloader:
                 images, masks = images.to(device), masks.to(device)
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast('cuda', dtype=autocast_dtype):
                     logits = model(images)
                     # Compute validation loss (same loss function as training)
                     _, val_loss_components = compute_qat_qad_loss(
@@ -1436,7 +1453,7 @@ def train_single_recipe(
         if verbose:
             print(f"\n   📊 Final evaluation using best checkpoint (epoch {best_epoch})")
     
-    inference_results = run_validation_inference(model, val_dataloader, device)
+    inference_results = run_validation_inference(model, val_dataloader, device, amp_dtype=amp_dtype)
     
     results = {
         "history": history,
@@ -1758,7 +1775,8 @@ def get_training_config(
     seed: int,
     qad_task_weight: float = 1.0,
     qad_distill_weight: float = 1.0,
-    qad_temperature: float = 2.0
+    qad_temperature: float = 2.0,
+    amp_dtype: str = "fp16",
 ) -> dict:
     """
     Build training config dict for a specific loss type.
@@ -1772,6 +1790,7 @@ def get_training_config(
         loss_type: "tversky" (QAT) or "qad_tversky" (QAD)
         seed: Random seed
         qad_*: QAD-specific hyperparameters (only used if "qad" in loss_type)
+        amp_dtype: Mixed-precision dtype, "fp16" or "bf16"
         
     Returns:
         Configuration dictionary
@@ -1789,7 +1808,13 @@ def get_training_config(
         config["qad_task_weight"] = qad_task_weight
         config["qad_distill_weight"] = qad_distill_weight
         config["qad_temperature"] = qad_temperature
+    # Only non-default precision enters the hash, so existing FP16 checkpoints keep theirs.
+    if amp_dtype != "fp16":
+        config["amp_dtype"] = amp_dtype
     return config
+
+
+AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 
 
 def get_checkpoint_path(
@@ -2231,7 +2256,8 @@ def run_validation_inference(
     val_dataloader: DataLoader,
     device: torch.device,
     use_amp: bool = True,
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    amp_dtype: str = "fp16",
 ) -> Dict[str, Any]:
     """
     Run inference on validation data and compute all telemetry metrics.
@@ -2259,6 +2285,7 @@ def run_validation_inference(
         device: Target device
         use_amp: Use automatic mixed precision
         threshold: Decision threshold for point metrics (default: 0.5)
+        amp_dtype: Autocast dtype, "fp16" (default) or "bf16"; match training
         
     Returns:
         Dictionary with all metrics, curves, and raw data
@@ -2273,7 +2300,7 @@ def run_validation_inference(
         for images, masks in val_dataloader:
             images = images.to(device)
             
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPES[amp_dtype]):
                 logits = model(images)
             
             probs_batch = torch.sigmoid(logits.float()).cpu()

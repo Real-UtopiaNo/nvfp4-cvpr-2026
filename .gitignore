@@ -9,6 +9,7 @@ checkpoints/
 results/
 archive*/
 comparison_plots/
+origin_source/
 
 # Python
 __pycache__/

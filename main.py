@@ -83,6 +83,7 @@ HAS_CNN = False
 try:
     from cnn_qat import (
         ScalableCNNQAT, SUPPORTED_RECIPES as CNN_RECIPES, CNN_SCALES,
+        available_qat_recipes as _cnn_qat_recipes,
         _QAT_RUNTIME_AVAILABLE as _CNN_QAT_RUNTIME,
         _QAT_RUNTIME_ADVANCED_AVAILABLE as _CNN_QAT_RUNTIME_ADV,
     )
@@ -101,6 +102,7 @@ HAS_SWIN = False
 try:
     from swin_qat import (
         create_swin_qat, SUPPORTED_RECIPES as SWIN_RECIPES, SWIN_CONFIGS,
+        available_qat_recipes as _swin_qat_recipes,
         _QAT_RUNTIME_AVAILABLE as _SWIN_QAT_RUNTIME,
         _QAT_RUNTIME_ADVANCED_AVAILABLE as _SWIN_QAT_RUNTIME_ADV,
     )
@@ -112,6 +114,7 @@ HAS_VIT = False
 try:
     from vit_qat import (
         create_vit_qat, SUPPORTED_RECIPES as VIT_RECIPES,
+        available_qat_recipes as _vit_qat_recipes,
         _QAT_RUNTIME_AVAILABLE as _VIT_QAT_RUNTIME,
         _QAT_RUNTIME_ADVANCED_AVAILABLE as _VIT_QAT_RUNTIME_ADV,
     )
@@ -150,6 +153,7 @@ ARCH_CONFIGS = {
         "available": lambda: HAS_CNN,
         "qat_runtime": lambda: HAS_CNN and _CNN_QAT_RUNTIME,
         "qat_runtime_adv": lambda: HAS_CNN and _CNN_QAT_RUNTIME_ADV,
+        "qat_recipes": lambda: _cnn_qat_recipes(),
     },
     "vit_adamw": {
         "factory": "vit",
@@ -160,6 +164,7 @@ ARCH_CONFIGS = {
         "available": lambda: HAS_VIT,
         "qat_runtime": lambda: HAS_VIT and _VIT_QAT_RUNTIME,
         "qat_runtime_adv": lambda: HAS_VIT and _VIT_QAT_RUNTIME_ADV,
+        "qat_recipes": lambda: _vit_qat_recipes(),
     },
     "vit_adamax": {
         "factory": "vit",
@@ -170,6 +175,7 @@ ARCH_CONFIGS = {
         "available": lambda: HAS_VIT,
         "qat_runtime": lambda: HAS_VIT and _VIT_QAT_RUNTIME,
         "qat_runtime_adv": lambda: HAS_VIT and _VIT_QAT_RUNTIME_ADV,
+        "qat_recipes": lambda: _vit_qat_recipes(),
     },
     "swin": {
         "factory": "swin",
@@ -180,10 +186,15 @@ ARCH_CONFIGS = {
         "available": lambda: HAS_SWIN,
         "qat_runtime": lambda: HAS_SWIN and _SWIN_QAT_RUNTIME,
         "qat_runtime_adv": lambda: HAS_SWIN and _SWIN_QAT_RUNTIME_ADV,
+        "qat_recipes": lambda: _swin_qat_recipes(),
     },
 }
 
 ADVANCED_QAT_RECIPES = {4, 5, 6, 7, 8}
+
+# Recipes that fine-tune another recipe's trained checkpoint (same seed and config)
+# instead of training from the shared initial weights.
+QAT_FINETUNE = {13: {"source_recipe": 0, "epochs": 20, "lr_scale": 0.1}}
 
 
 def _get_model_factory(arch_name: str) -> Callable:
@@ -204,6 +215,8 @@ def can_run_recipe(arch_name: str, recipe_id: int) -> bool:
     if not cfg["qat_runtime"]():
         return False
     if recipe_id in ADVANCED_QAT_RECIPES and not cfg["qat_runtime_adv"]():
+        return False
+    if "qat_recipes" in cfg and recipe_id not in cfg["qat_recipes"]():
         return False
     return True
 
@@ -296,8 +309,8 @@ def patient_holdout_split(
     from sklearn.model_selection import train_test_split
 
     burden_bins = _patient_tumor_burden_bins(df)
-    patient_ids = burden_bins.index.values
-    strat_labels = burden_bins.values
+    patient_ids = burden_bins.index.to_numpy()
+    strat_labels = burden_bins.to_numpy()
 
     train_pids, temp_pids, train_strat, temp_strat = train_test_split(
         patient_ids, strat_labels, test_size=test_size, random_state=seed,
@@ -318,6 +331,45 @@ def patient_holdout_split(
     return [(train_df, val_df, test_df)]
 
 
+def slice_random_split(
+    df: pd.DataFrame,
+    seed: int = 2026,
+    test_size: float = 0.2,
+    val_ratio: float = 0.5,
+) -> List[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """
+    Slice-level stratified random split, matching the original per-architecture
+    notebooks (``load_lgg_dataset``). Slices from the same patient can land in
+    different partitions, so this split leaks patient identity and is kept only
+    to reproduce earlier results.
+
+    Returns a list with a single (train_df, val_df, test_df) tuple.
+    """
+    from sklearn.model_selection import train_test_split
+
+    train_df, temp_df = train_test_split(
+        df, test_size=test_size, stratify=df["slice_diagnosis"], random_state=seed,
+    )
+    val_df, test_df = train_test_split(
+        temp_df, test_size=val_ratio, stratify=temp_df["slice_diagnosis"], random_state=seed,
+    )
+
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+
+    _print_split_stats("Slice-random", train_df, val_df, test_df)
+    return [(train_df, val_df, test_df)]
+
+
+def build_splits(df: pd.DataFrame, split: str, seed: int, n_folds: int = 5):
+    if split == "patient-holdout":
+        return patient_holdout_split(df, seed=seed)
+    if split == "slice-random":
+        return slice_random_split(df, seed=seed)
+    return patient_kfold_split(df, n_folds=n_folds, seed=seed)
+
+
 def patient_kfold_split(
     df: pd.DataFrame,
     n_folds: int = 5,
@@ -333,8 +385,8 @@ def patient_kfold_split(
     from sklearn.model_selection import StratifiedKFold, train_test_split
 
     burden_bins = _patient_tumor_burden_bins(df)
-    patient_ids = burden_bins.index.values
-    strat_labels = burden_bins.values
+    patient_ids = burden_bins.index.to_numpy()
+    strat_labels = burden_bins.to_numpy()
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
 
@@ -389,10 +441,7 @@ def run_training(args):
     df = DATASET_REGISTRY[args.dataset](args.data_path)
 
     # --- Generate splits ---
-    if args.split == "patient-holdout":
-        folds = patient_holdout_split(df, seed=args.split_seed)
-    else:
-        folds = patient_kfold_split(df, n_folds=args.folds, seed=args.split_seed)
+    folds = build_splits(df, args.split, args.split_seed, n_folds=args.folds)
 
     # --- Resolve arch / size / recipe lists ---
     archs = list(ARCH_CONFIGS.keys()) if "all" in args.arch else args.arch
@@ -415,7 +464,7 @@ def run_training(args):
     failed = 0
 
     for fold_idx, (train_df, val_df, test_df) in enumerate(folds):
-        fold_name = "single" if args.split == "patient-holdout" else f"fold_{fold_idx}"
+        fold_name = "single" if args.split != "patient-kfold" else f"fold_{fold_idx}"
         print(f"\n{'='*80}")
         print(f"FOLD: {fold_name}")
         print(f"{'='*80}")
@@ -456,6 +505,7 @@ def run_training(args):
                         weight_decay=cfg["weight_decay"],
                         loss_type=LOSS_TYPE,
                         seed=seed,
+                        amp_dtype=args.amp_dtype,
                     )
                     config_hash = compute_config_hash(config_dict)
 
@@ -484,6 +534,20 @@ def run_training(args):
                             )
                             continue
 
+                        init_weights, lr, train_epochs = baseline_weights, cfg["lr"], None
+                        finetune = QAT_FINETUNE.get(recipe_id)
+                        if finetune:
+                            src_ckpt = get_checkpoint_path(ckpt_dir, finetune["source_recipe"], size,
+                                                           args.epochs, LOSS_TYPE, config_hash)
+                            if not src_ckpt.exists():
+                                print(f"  {tag} Recipe {recipe_id} ({recipe_name}): skipped "
+                                      f"(needs {src_ckpt.name} to fine-tune)")
+                                skipped += 1
+                                continue
+                            init_weights = torch.load(src_ckpt, map_location="cpu", weights_only=False)["state_dict"]
+                            lr, train_epochs = cfg["lr"] * finetune["lr_scale"], finetune["epochs"]
+                            reason += f"; fine-tuning {src_ckpt.name} for {train_epochs} epochs at lr={lr:g}"
+
                         print(f"\n  {tag} Recipe {recipe_id} ({recipe_name}): TRAINING ({reason})")
                         set_seed(seed)
 
@@ -493,21 +557,23 @@ def run_training(args):
                                 loss_type=LOSS_TYPE,
                                 model_size=size,
                                 num_epochs=args.epochs,
+                                train_epochs=train_epochs,
                                 train_dataloader=train_loader,
                                 val_dataloader=val_loader,
                                 device=device,
                                 create_model_fn=factory,
-                                baseline_weights=baseline_weights,
+                                baseline_weights=init_weights,
                                 ckpt_dir=ckpt_dir,
                                 config_hash=config_hash,
                                 config_dict=config_dict,
-                                learning_rate=cfg["lr"],
+                                learning_rate=lr,
                                 weight_decay=cfg["weight_decay"],
                                 optimizer_type=cfg["optimizer"],
                                 early_stopping_patience=EARLY_STOPPING_PATIENCE,
                                 early_stopping_metric=EARLY_STOPPING_METRIC,
                                 early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
                                 early_stopping_warmup=EARLY_STOPPING_WARMUP,
+                                amp_dtype=args.amp_dtype,
                             )
 
                             _save_metrics_json(
@@ -555,6 +621,7 @@ def _save_metrics_json(results, ckpt_dir, recipe_id, recipe_name, arch_name,
         "fold": fold_name,
         "dataset": args.dataset,
         "split": args.split,
+        "amp_dtype": args.amp_dtype,
         "config_hash": config_hash,
         "auprc": results.get("auprc", 0),
         "dice": results.get("best_dice", 0),
@@ -598,6 +665,7 @@ def _save_metrics_from_checkpoint(ckpt_path, ckpt_dir, recipe_id, recipe_name,
             "fold": fold_name,
             "dataset": args.dataset,
             "split": args.split,
+            "amp_dtype": args.amp_dtype,
             "config_hash": config_hash,
             "auprc": 0,
             "dice": ckpt.get("best_dice", 0),
@@ -632,7 +700,7 @@ def _evaluate_on_test(factory, size, recipe_id, baseline_weights, ckpt_dir,
         model = factory(model_size=size, recipe_id=recipe_id).to(device)
         model.load_state_dict(state_dict, strict=False)
 
-        test_results = run_validation_inference(model, test_loader, device)
+        test_results = run_validation_inference(model, test_loader, device, amp_dtype=args.amp_dtype)
 
         metrics_dir = ckpt_dir / "metrics"
         metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -648,6 +716,7 @@ def _evaluate_on_test(factory, size, recipe_id, baseline_weights, ckpt_dir,
             "fold": fold_name,
             "dataset": args.dataset,
             "split": args.split,
+            "amp_dtype": args.amp_dtype,
             "eval_set": "test",
             "auprc": test_results.get("auprc", 0),
             "dice": test_results.get("dice", 0),
@@ -690,16 +759,13 @@ def run_evaluation(args):
         return
     df = DATASET_REGISTRY[args.dataset](args.data_path)
 
-    if args.split == "patient-holdout":
-        folds = patient_holdout_split(df, seed=args.split_seed)
-    else:
-        folds = patient_kfold_split(df, n_folds=args.folds, seed=args.split_seed)
+    folds = build_splits(df, args.split, args.split_seed, n_folds=args.folds)
 
     archs = list(ARCH_CONFIGS.keys()) if "all" in args.arch else args.arch
 
     evaluated = 0
     for fold_idx, (train_df, val_df, test_df) in enumerate(folds):
-        fold_name = "single" if args.split == "patient-holdout" else f"fold_{fold_idx}"
+        fold_name = "single" if args.split != "patient-kfold" else f"fold_{fold_idx}"
         _, _, test_loader = create_dataloaders(train_df, val_df, test_df, batch_size=args.batch_size)
 
         for arch_name in archs:
@@ -720,12 +786,14 @@ def run_evaluation(args):
                         msize = ckpt.get("model_size", "matched_4m")
                         state_dict = ckpt.get("state_dict", ckpt)
 
+                        amp = (ckpt.get("config") or {}).get("amp_dtype", "fp16")
+
                         model = factory(model_size=msize, recipe_id=rid).to(device)
                         model.load_state_dict(state_dict, strict=False)
-                        test_results = run_validation_inference(model, test_loader, device)
+                        test_results = run_validation_inference(model, test_loader, device, amp_dtype=amp)
 
                         rname = RECIPE_NAMES.get(rid, f"R{rid}")
-                        print(f"  [{arch_name}|{msize}|seed{seed}|{fold_name}] "
+                        print(f"  [{arch_name}|{msize}|seed{seed}|{fold_name}|{amp}] "
                               f"Recipe {rid} ({rname}): "
                               f"AUPRC={test_results.get('auprc', 0):.4f}")
 
@@ -762,7 +830,10 @@ def run_analysis(args):
         return
 
     df = pd.DataFrame(all_metrics)
+    # Records written before the --amp-dtype option existed were all FP16.
+    df["amp_dtype"] = df["amp_dtype"].fillna("fp16") if "amp_dtype" in df.columns else "fp16"
     print(f"\nLoaded {len(df)} metric records from {output_dir}")
+    print(f"  AMP dtypes: {sorted(df['amp_dtype'].unique())}")
     print(f"  Architectures: {sorted(df['arch'].unique())}")
     print(f"  Sizes: {sorted(df['model_size'].unique())}")
     print(f"  Recipes: {sorted(df['recipe_id'].unique())}")
@@ -783,8 +854,8 @@ def run_analysis(args):
         group_cols.append("fold")
 
     summary_rows = []
-    for keys, group in df.groupby(["arch", "model_size", "recipe_id"]):
-        arch, msize, rid = keys
+    for keys, group in df.groupby(["amp_dtype", "arch", "model_size", "recipe_id"]):
+        amp, arch, msize, rid = keys
         vals = group[primary_metric].dropna().values
         n = len(vals)
         if n == 0:
@@ -796,6 +867,7 @@ def run_analysis(args):
         rname = group["recipe_name"].iloc[0] if "recipe_name" in group.columns else RECIPE_NAMES.get(rid, f"R{rid}")
 
         summary_rows.append({
+            "amp_dtype": amp,
             "arch": arch,
             "model_size": msize,
             "recipe_id": rid,
@@ -844,16 +916,16 @@ def _print_summary_table(summary_df, metric):
     col_std = f"{metric}_std"
     col_ci = f"{metric}_ci95"
 
-    print(f"\n{'='*90}")
-    print(f"{'Arch':<12} {'Size':<14} {'Recipe':<14} {'N':>3}  "
+    print(f"\n{'='*96}")
+    print(f"{'AMP':<5} {'Arch':<12} {'Size':<14} {'Recipe':<14} {'N':>3}  "
           f"{metric.upper()+' Mean':>12} {'Std':>8} {'95% CI':>8}")
-    print(f"{'-'*90}")
+    print(f"{'-'*96}")
 
-    for _, row in summary_df.sort_values(["arch", "model_size", "recipe_id"]).iterrows():
-        print(f"{row['arch']:<12} {row['model_size']:<14} "
+    for _, row in summary_df.sort_values(["amp_dtype", "arch", "model_size", "recipe_id"]).iterrows():
+        print(f"{row['amp_dtype']:<5} {row['arch']:<12} {row['model_size']:<14} "
               f"{row['recipe_name']:<14} {row['n']:>3}  "
               f"{row[col_mean]:>12.4f} {row[col_std]:>8.4f} {row[col_ci]:>8.4f}")
-    print(f"{'='*90}")
+    print(f"{'='*96}")
 
 
 def _compute_pairwise_tests(df, metric):
@@ -862,7 +934,7 @@ def _compute_pairwise_tests(df, metric):
     from itertools import combinations
 
     rows = []
-    for (arch, msize), group in df.groupby(["arch", "model_size"]):
+    for (amp, arch, msize), group in df.groupby(["amp_dtype", "arch", "model_size"]):
         recipe_ids = sorted(group["recipe_id"].unique())
         if len(recipe_ids) < 2:
             continue
@@ -890,6 +962,7 @@ def _compute_pairwise_tests(df, metric):
             cohens_d = np.mean(diff) / pooled_std if pooled_std > 0 else 0
 
             rows.append({
+                "amp_dtype": amp,
                 "arch": arch,
                 "model_size": msize,
                 "recipe_a": r1,
@@ -944,12 +1017,13 @@ def _print_dry_run(folds, archs, sizes, seeds, recipes, args):
     print(f"  Recipes:    {recipes}")
     print(f"  Epochs:     {args.epochs}")
     print(f"  Batch size: {args.batch_size}")
+    print(f"  AMP dtype:  {args.amp_dtype}")
     print(f"  Output:     {args.output_dir}")
 
     total = 0
     runnable = 0
     for fold_idx in range(len(folds)):
-        fold_name = "single" if args.split == "patient-holdout" else f"fold_{fold_idx}"
+        fold_name = "single" if args.split != "patient-kfold" else f"fold_{fold_idx}"
         for arch_name in archs:
             for seed in seeds:
                 for size in sizes:
@@ -1010,7 +1084,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--data-path", default=str(MAIN_DIR / "lgg-mri-segmentation" / "kaggle_3m"),
                     help="Path to dataset root")
     t.add_argument("--split", default="patient-holdout",
-                    choices=["patient-holdout", "patient-kfold"],
+                    choices=["patient-holdout", "patient-kfold", "slice-random"],
                     help="Split strategy")
     t.add_argument("--split-seed", type=int, default=2026,
                     help="Seed for data splitting (fixed across training seeds)")
@@ -1027,6 +1101,9 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--force-retrain", action="store_true")
     t.add_argument("--dry-run", action="store_true")
     t.add_argument("--gpu", type=int, default=0)
+    t.add_argument("--amp-dtype", default="fp16", choices=["fp16", "bf16"],
+                    help="Autocast dtype for the whole model. fp16 uses GradScaler; "
+                         "bf16 matches the paper's BF16 training")
     t.add_argument("--eval-test", action="store_true", default=True,
                     help="Evaluate on test set after training (default: True)")
     t.add_argument("--no-eval-test", dest="eval_test", action="store_false")
@@ -1038,7 +1115,7 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--dataset", default="lgg")
     e.add_argument("--data-path", default=str(MAIN_DIR / "lgg-mri-segmentation" / "kaggle_3m"))
     e.add_argument("--split", default="patient-holdout",
-                    choices=["patient-holdout", "patient-kfold"])
+                    choices=["patient-holdout", "patient-kfold", "slice-random"])
     e.add_argument("--split-seed", type=int, default=2026)
     e.add_argument("--folds", type=int, default=5)
     e.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)

@@ -14,15 +14,69 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_VIT_PATH = str(Path(__file__).parent.parent / "vit")
-if _VIT_PATH not in sys.path:
-    sys.path.insert(0, _VIT_PATH)
+for _sub in ("vit", "cnn"):
+    _path = str(Path(__file__).parent.parent / _sub)
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from vit_qat import (
-    NVFPQuantizer, QuantizedLinearFunction, SUPPORTED_RECIPES,
-    _QAT_RUNTIME_AVAILABLE, _QAT_RUNTIME_ADVANCED_AVAILABLE,
+    NVFPQuantizer, SUPPORTED_RECIPES as _VIT_RECIPES, make_linear, quantized_linear,
+    available_qat_recipes as _vit_qat_recipes, _QAT_RUNTIME_AVAILABLE, _QAT_RUNTIME_ADVANCED_AVAILABLE,
     PatchEmbedding, DropPath, MLP, SegmentationDecoder,
 )
+from cnn_qat import (
+    QuantizedConv2dFunction, QuantizedConvTranspose2dFunction,
+    _nvfp4_qdq_along, _nvfp4_wgrad, _qat_out_dtype,
+)
+
+# Recipe 12 = recipe 1 extended to every weighted layer: the transformer Linears use
+# recipe 1's TE path, and the patch embedding, decoder and classifier (full precision
+# in recipe 1) get the same NVFP4 Full treatment.
+FULL_MODEL_RECIPES = {12: 1}
+SUPPORTED_RECIPES = {
+    **_VIT_RECIPES,
+    12: {
+        "name": "NVFP4 Full (all layers)",
+        "description": "Recipe 1 plus NVFP4 patch embedding, decoder and classifier",
+        "forward_quantized": True,
+        "backward_quantized": True,
+        "requires_qat_runtime": True,
+    },
+}
+
+
+def available_qat_recipes() -> set:
+    recipes = _vit_qat_recipes()
+    return recipes | {r for r, base in FULL_MODEL_RECIPES.items() if base in recipes}
+
+
+class QuantizedLinearFunction(torch.autograd.Function):
+    """NVFP4 Full Linear on 2D operands, blocks along each GEMM's reduction dim:
+    fprop Y = X W^T (over K), dgrad dX = G W (over N), wgrad dW = G^T X (over M)."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias):
+        ctx.save_for_backward(x, weight)
+        ctx.bias_dtype = None if bias is None else bias.dtype
+        with torch.autocast("cuda", enabled=False):
+            y = _nvfp4_qdq_along(x, 1) @ _nvfp4_qdq_along(weight, 1).t()
+            if bias is not None:
+                y = y + bias.float()
+        return y.to(_qat_out_dtype(x))
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight = ctx.saved_tensors
+        grad_x = grad_w = grad_b = None
+        with torch.autocast("cuda", enabled=False):
+            g = grad_out.float()
+            if ctx.needs_input_grad[0]:
+                grad_x = (_nvfp4_qdq_along(g, 1) @ _nvfp4_qdq_along(weight, 0)).to(x.dtype)
+            if ctx.needs_input_grad[1]:
+                grad_w = _nvfp4_wgrad(g.t(), x.float().t()).to(weight.dtype)
+            if ctx.bias_dtype is not None and ctx.needs_input_grad[2]:
+                grad_b = g.sum(0).to(ctx.bias_dtype)
+        return grad_x, grad_w, grad_b
 
 SWIN_CONFIGS = {
     "matched_500k": {"embed_dim": 64, "depth": 10, "num_heads": 4, "mlp_ratio": 3.0, "patch_size": 16, "window_size": 4, "description": "~530K params, win=4 (local)"},
@@ -51,8 +105,8 @@ class WindowedMultiHeadSelfAttention(nn.Module):
         self.shift_size = shift_size
         self.grid_size = grid_size
         self.quantizer = quantizer
-        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.qkv = make_linear(embed_dim, embed_dim * 3, bias=qkv_bias, quantizer=quantizer)
+        self.proj = make_linear(embed_dim, embed_dim, quantizer=quantizer)
         self.attn_drop = nn.Dropout(dropout)
         self.proj_drop = nn.Dropout(dropout)
         self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads))
@@ -85,7 +139,7 @@ class WindowedMultiHeadSelfAttention(nn.Module):
 
     def _linear(self, x, linear, quantize=True):
         if self.quantizer and quantize:
-            return QuantizedLinearFunction.apply(x, linear.weight, linear.bias, self.quantizer)
+            return quantized_linear(x, linear, self.quantizer)
         return linear(x)
 
     def forward(self, x):
@@ -132,7 +186,11 @@ class SwinViTQAT(nn.Module):
         self.embed_dim = embed_dim
         self.recipe_id = recipe_id
         self.grid_size = img_size // patch_size
-        self.quantizer = NVFPQuantizer(recipe_id) if recipe_id != 0 else None
+        self.quantize_all = recipe_id in FULL_MODEL_RECIPES
+        if self.quantize_all and recipe_id not in available_qat_recipes():
+            raise RuntimeError(f"Recipe {recipe_id} needs the NVFP4 runtime of recipe {FULL_MODEL_RECIPES[recipe_id]}")
+        linear_recipe = FULL_MODEL_RECIPES.get(recipe_id, recipe_id)
+        self.quantizer = NVFPQuantizer(linear_recipe) if linear_recipe != 0 else None
         self.patch_embed = PatchEmbedding(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.grid_size ** 2
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
@@ -157,14 +215,35 @@ class SwinViTQAT(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
 
+    def _embed_patches(self, x):
+        if not self.quantize_all:
+            return self.patch_embed(x)
+        # kernel == stride, so the conv is one GEMM over K = C_in * P * P per patch.
+        conv = self.patch_embed.proj
+        cols = F.unfold(x, conv.kernel_size, stride=conv.stride).transpose(1, 2)
+        y = QuantizedLinearFunction.apply(cols.reshape(-1, cols.shape[-1]), conv.weight.flatten(1), conv.bias)
+        return self.patch_embed.norm(y.view(x.shape[0], -1, conv.out_channels))
+
+    def _decode(self, x):
+        if not self.quantize_all:
+            return self.decoder(x, self.grid_size)
+        B, N, D = x.shape
+        x = x.transpose(1, 2).reshape(B, D, self.grid_size, self.grid_size)
+        for up, norm, act in self.decoder.decoder_blocks:
+            x = QuantizedConvTranspose2dFunction.apply(
+                x, up.weight, up.bias, None, up.stride, up.padding, up.output_padding, up.dilation, up.groups)
+            x = act(norm(x))
+        c = self.decoder.classifier
+        return QuantizedConv2dFunction.apply(x, c.weight, c.bias, None, c.stride, c.padding, c.dilation, c.groups)
+
     def forward(self, x):
-        x = self.patch_embed(x)
+        x = self._embed_patches(x)
         x = x + self.pos_embed
         x = self.pos_drop(x)
         for block in self.blocks:
             x = block(x)
         x = self.norm(x)
-        return self.decoder(x, self.grid_size)
+        return self._decode(x)
 
     def get_recipe_info(self):
         return SUPPORTED_RECIPES.get(self.recipe_id, {})

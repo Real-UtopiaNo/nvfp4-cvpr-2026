@@ -167,20 +167,59 @@ SUPPORTED_RECIPES = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PUBLIC NVFP4 QAT RUNTIME COMPATIBILITY
+# NVFP4 QAT RUNTIME (Transformer Engine NVFP4Quantizer, fake quantization)
 # ═══════════════════════════════════════════════════════════════════════════════
+# Transformer Engine has no convolution module, so quantized convs run as
+# NVFP4 quantize -> dequantize -> FP32 convolution. The dequantized values sit
+# exactly on the NVFP4 grid (E2M1 x E4M3 block scale x FP32 global scale), which
+# reproduces an FP4 Tensor Core GEMM up to accumulation-order rounding.
 
-_QAT_RUNTIME_AVAILABLE = False
+try:
+    from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer as _TENVFP4Quantizer
+except ImportError:
+    _TENVFP4Quantizer = None
+
+_CC_MAJOR = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+
+_QAT_RUNTIME_AVAILABLE = _TENVFP4Quantizer is not None and _CC_MAJOR >= 10
 _QAT_RUNTIME_ADVANCED_AVAILABLE = False
 
+BASE_QAT_RECIPES = {1}
+NVFP4_BLOCK = 16
+
 PUBLIC_QAT_RUNTIME_MESSAGE = (
-    "NVFP4 QAT recipes require a compatible NVFP4 quantization runtime. Vendor-specific runtime integration is intentionally omitted from this public release. Use recipe 0 for baseline training with the provided code."
+    "CNN NVFP4 QAT requires Transformer Engine (NVFP4Quantizer) on a Blackwell GPU. "
+    "Only recipe 1 is implemented for the CNN; recipes 2-8 are not."
 )
 
 
-def check_qat_runtime_available():
-    """Raise a public-safe error for QAT recipes in this release."""
+def available_qat_recipes() -> set:
+    """Recipe IDs (besides baseline 0) that can run in the current environment."""
+    return set(BASE_QAT_RECIPES) if _QAT_RUNTIME_AVAILABLE else set()
+
+
+def check_qat_runtime_available(recipe_id: Optional[int] = None):
+    """Raise if the requested NVFP4 recipe cannot run in this environment."""
+    if recipe_id is None and _QAT_RUNTIME_AVAILABLE:
+        return
+    if recipe_id is not None and recipe_id in available_qat_recipes():
+        return
     raise RuntimeError(PUBLIC_QAT_RUNTIME_MESSAGE)
+
+
+def parse_recipe_id(recipe_id: int) -> Tuple[int, bool]:
+    """Split a recipe ID into ``(base_recipe, quantize_first_last)``.
+
+    IDs in ``SUPPORTED_RECIPES`` are used as-is with boundary layers unquantized.
+    Variant IDs are ``base_recipe * 10 + digit``: digit 1 quantizes the first and
+    last layers, digit 2 keeps them unquantized.
+    """
+    if recipe_id in SUPPORTED_RECIPES:
+        return recipe_id, False
+    base, digit = divmod(recipe_id, 10)
+    if base in SUPPORTED_RECIPES and digit in (1, 2):
+        return base, digit == 1
+    raise ValueError(f"Unsupported recipe_id: {recipe_id}. Supported: {list(SUPPORTED_RECIPES.keys())}")
 
 
 def detect_gpu_architecture():
@@ -206,7 +245,7 @@ def check_recipe_hardware_compatibility(recipe_id: int, verbose: bool = True):
     """Report public-release support for the selected recipe."""
     if recipe_id not in SUPPORTED_RECIPES:
         return False
-    if recipe_id == 0:
+    if recipe_id == 0 or recipe_id in available_qat_recipes():
         return True
     if verbose:
         warnings.warn(PUBLIC_QAT_RUNTIME_MESSAGE, RuntimeWarning)
@@ -215,10 +254,12 @@ def check_recipe_hardware_compatibility(recipe_id: int, verbose: bool = True):
 
 class NVFPQuantizer:
     """
-    Public placeholder for NVFP4 QAT integration.
+    NVFP4 QAT configuration for one model.
 
-    The paper's recipe metadata is provided for reproducibility context, while
-    vendor/runtime-specific quantization integration is intentionally omitted.
+    Quantized convolutions go through ``QuantizedConv2dFunction`` /
+    ``QuantizedConvTranspose2dFunction``, which apply recipe 1 semantics
+    (1D 16-element blocks, round-to-nearest, no RHT, no SR) to the forward
+    GEMM and both backward GEMMs.
     """
 
     def __init__(self, recipe_id):
@@ -234,51 +275,141 @@ class NVFPQuantizer:
         self.has_2d_weights = recipe_id in [4, 5, 7]
         self.uses_autograd = recipe_id == 8
         self.requires_qat_runtime = recipe_id != 0
-        self.last_x_mse = None
-        self.last_w_mse = None
-        self.last_g_mse = None
 
         if self.enabled:
-            check_qat_runtime_available()
+            check_qat_runtime_available(recipe_id)
 
-    def quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
-        if self.enabled:
-            check_qat_runtime_available()
-        return x
 
-    def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
-        if self.enabled:
-            check_qat_runtime_available()
-        return w
+_ROWWISE_NVFP4 = None
 
-    def quantize_gradient(self, g: torch.Tensor) -> torch.Tensor:
-        if self.enabled:
-            check_qat_runtime_available()
-        return g
+
+def _nvfp4_qdq_rows(t: torch.Tensor) -> torch.Tensor:
+    """NVFP4 quantize -> dequantize a 2D tensor, 16-element blocks along the last dim.
+
+    TE needs both dims to be multiples of 16; zero padding does not change the
+    per-tensor amax and only fills blocks that are sliced away afterwards.
+    """
+    global _ROWWISE_NVFP4
+    if _ROWWISE_NVFP4 is None:
+        _ROWWISE_NVFP4 = _TENVFP4Quantizer(
+            rowwise=True, columnwise=False, with_rht=False,
+            stochastic_rounding=False, with_2d_quantization=False,
+        )
+    rows, cols = t.shape
+    pad_r, pad_c = (-rows) % NVFP4_BLOCK, (-cols) % NVFP4_BLOCK
+    src = t.float()
+    if pad_r or pad_c:
+        src = F.pad(src, (0, pad_c, 0, pad_r))
+    out = _ROWWISE_NVFP4.quantize(src.contiguous()).dequantize()
+    return out[:rows, :cols] if (pad_r or pad_c) else out
+
+
+def _nvfp4_qdq_along(t: torch.Tensor, dim: int) -> torch.Tensor:
+    """NVFP4 quantize -> dequantize with 16-element blocks along ``dim`` (FP32 result)."""
+    moved = t.movedim(dim, -1)
+    shape = moved.shape
+    return _nvfp4_qdq_rows(moved.reshape(-1, shape[-1])).reshape(shape).movedim(-1, dim)
+
+
+def _nvfp4_wgrad(a_rows: torch.Tensor, b_rows: torch.Tensor) -> torch.Tensor:
+    """``a_rows @ b_rows.T`` with both operands blocked along the shared M (batch x spatial) dim."""
+    return _nvfp4_qdq_rows(a_rows) @ _nvfp4_qdq_rows(b_rows).t()
+
+
+def _channels_by_m(t: torch.Tensor) -> torch.Tensor:
+    """(N, C, ...) -> (C, N * ...): one row per channel, columns ordered by sample then position."""
+    return t.float().movedim(1, 0).reshape(t.shape[1], -1)
+
+
+def _qat_out_dtype(x: torch.Tensor) -> torch.dtype:
+    return torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
 
 
 class QuantizedConv2dFunction(torch.autograd.Function):
-    """Public placeholder for the omitted NVFP4 Conv2d QAT path."""
+    """NVFP4 Conv2d. Each GEMM quantizes both operands along its reduction dim:
+    fprop  Y  = X * W   reduces over C_in  (X per pixel, W along C_in)
+    dgrad  dX = G *T W  reduces over C_out (G per pixel, W along C_out)
+    wgrad  dW = G x im2col(X) reduces over batch x output positions
+    """
 
     @staticmethod
-    def forward(ctx, *args, **kwargs):
-        check_qat_runtime_available()
+    def forward(ctx, x, weight, bias, quantizer, stride, padding, dilation, groups):
+        if groups != 1:
+            raise NotImplementedError("NVFP4 Conv2d supports groups=1 only")
+        ctx.save_for_backward(x, weight)
+        ctx.conv_args = (stride, padding, dilation)
+        ctx.bias_dtype = None if bias is None else bias.dtype
+        with torch.autocast("cuda", enabled=False):
+            y = F.conv2d(
+                _nvfp4_qdq_along(x, 1), _nvfp4_qdq_along(weight, 1),
+                None if bias is None else bias.float(), stride, padding, dilation,
+            )
+        return y.to(_qat_out_dtype(x))
 
     @staticmethod
-    def backward(ctx, *grad_outputs):
-        check_qat_runtime_available()
+    def backward(ctx, grad_out):
+        x, weight = ctx.saved_tensors
+        stride, padding, dilation = ctx.conv_args
+        grad_x = grad_w = grad_b = None
+        with torch.autocast("cuda", enabled=False):
+            g = grad_out.float()
+            if ctx.needs_input_grad[0]:
+                grad_x = torch.nn.grad.conv2d_input(
+                    x.shape, _nvfp4_qdq_along(weight, 0), _nvfp4_qdq_along(g, 1),
+                    stride, padding, dilation,
+                ).to(x.dtype)
+            if ctx.needs_input_grad[1]:
+                cols = F.unfold(x.float(), weight.shape[2:], dilation, padding, stride)
+                cols = cols.movedim(1, 0).reshape(cols.shape[1], -1)
+                grad_w = _nvfp4_wgrad(_channels_by_m(g), cols).view(weight.shape).to(weight.dtype)
+                del cols
+            if ctx.bias_dtype is not None and ctx.needs_input_grad[2]:
+                grad_b = g.sum((0, 2, 3)).to(ctx.bias_dtype)
+        return grad_x, grad_w, grad_b, None, None, None, None, None
 
 
 class QuantizedConvTranspose2dFunction(torch.autograd.Function):
-    """Public placeholder for the omitted NVFP4 ConvTranspose2d QAT path."""
+    """NVFP4 ConvTranspose2d (weight layout C_in x C_out x kh x kw):
+    fprop  Y  = X *T W reduces over C_in  (X per pixel, W along C_in)
+    dgrad  dX = G * W  reduces over C_out (G per pixel, W along C_out)
+    wgrad  dW = X x im2col(G) reduces over batch x input positions
+    """
 
     @staticmethod
-    def forward(ctx, *args, **kwargs):
-        check_qat_runtime_available()
+    def forward(ctx, x, weight, bias, quantizer, stride, padding, output_padding, dilation, groups):
+        if groups != 1:
+            raise NotImplementedError("NVFP4 ConvTranspose2d supports groups=1 only")
+        ctx.save_for_backward(x, weight)
+        ctx.conv_args = (stride, padding, dilation)
+        ctx.bias_dtype = None if bias is None else bias.dtype
+        with torch.autocast("cuda", enabled=False):
+            y = F.conv_transpose2d(
+                _nvfp4_qdq_along(x, 1), _nvfp4_qdq_along(weight, 0),
+                None if bias is None else bias.float(),
+                stride, padding, output_padding, 1, dilation,
+            )
+        return y.to(_qat_out_dtype(x))
 
     @staticmethod
-    def backward(ctx, *grad_outputs):
-        check_qat_runtime_available()
+    def backward(ctx, grad_out):
+        x, weight = ctx.saved_tensors
+        stride, padding, dilation = ctx.conv_args
+        grad_x = grad_w = grad_b = None
+        with torch.autocast("cuda", enabled=False):
+            g = grad_out.float()
+            if ctx.needs_input_grad[0]:
+                grad_x = F.conv2d(
+                    _nvfp4_qdq_along(g, 1), _nvfp4_qdq_along(weight, 1),
+                    None, stride, padding, dilation,
+                ).to(x.dtype)
+            if ctx.needs_input_grad[1]:
+                cols = F.unfold(g, weight.shape[2:], dilation, padding, stride)
+                cols = cols.movedim(1, 0).reshape(cols.shape[1], -1)
+                grad_w = _nvfp4_wgrad(_channels_by_m(x), cols).view(weight.shape).to(weight.dtype)
+                del cols
+            if ctx.bias_dtype is not None and ctx.needs_input_grad[2]:
+                grad_b = g.sum((0, 2, 3)).to(ctx.bias_dtype)
+        return grad_x, grad_w, grad_b, None, None, None, None, None, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1639,7 +1770,7 @@ if __name__ == "__main__":
         print(f"  Quantize First/Last: {quant_first_last}")
         print(f"{'='*60}")
         
-        if base_recipe != 0 and not _QAT_RUNTIME_AVAILABLE:
+        if base_recipe != 0 and base_recipe not in available_qat_recipes():
             print("  ⚠️ Skipping (NVFP4 QAT runtime not available)")
             continue
         

@@ -1,3 +1,85 @@
+# Experiment
+
+## Reproducing the Swin 500K seed-scatter figures
+
+Both figures plot the test AUPRC of every seed (dots), the mean (bar) and a t-based 95% CI per recipe; the dashed line is the Baseline mean.
+
+| Figure | Recipes |
+|--------|---------|
+| `results/lgg/slice-random/single/swin/swin_500k_test_auprc_seeds_bf16_int4.png` | 0, 1, 8, 9, 10 |
+| `results/lgg/slice-random/single/swin/swin_500k_test_auprc_seeds_bf16_all_layers.png` | 0, 1, 8, 11, 12 |
+
+Recipes used here besides 0 (Baseline) and 1 (NVFP4 Full):
+
+| ID | Recipe | Trained? | Description |
+|----|--------|----------|-------------|
+| 8 | NVFP4 PTQ (RTN) | No | Baseline weights, W4A4 NVFP4 on the layers recipe 1 quantizes (all transformer Linears) |
+| 9 | INT4 PTQ (ch/tok) | No | Baseline weights, simulated symmetric INT4 W4A4 on the same layers, per-output-channel weight / per-token activation scales |
+| 10 | INT4 PTQ (g16) | No | As 9 with one FP32 scale per 16 elements along K |
+| 11 | NVFP4 PTQ (all layers) | No | As 8, plus the patch embedding, decoder ConvTranspose2d layers and classifier |
+| 12 | NVFP4 Full (all layers) | Yes, from scratch | Recipe 1 extended to the patch embedding, decoder and classifier |
+
+### Requirements
+
+- Blackwell GPU (SM 10.x / 12.x) with Transformer Engine NVFP4 support; recipes 1, 8, 11 and 12 need it (INT4 PTQ is simulated in PyTorch).
+- Run all commands from the repository root (inside the `nvfp4` container in our setup). Replace `/data/lgg-mri-segmentation/kaggle_3m` with your dataset path.
+- Keep `--split slice-random --batch-size 16 --amp-dtype bf16 --epochs 100` identical across training and plotting: they enter the config hash that links checkpoints, metrics and PTQ results. All runs use split seed 2026 and model seeds 2026–2035.
+
+### Step 1: train Baseline (0) and NVFP4 Full (1)
+
+```bash
+python main.py train --arch swin --sizes matched_500k \
+  --dataset lgg --split slice-random \
+  --seeds 2026 2027 2028 2029 2030 2031 2032 2033 2034 2035 \
+  --recipes 0 1 --epochs 100 --batch-size 16 --amp-dtype bf16 \
+  --data-path /data/lgg-mri-segmentation/kaggle_3m
+```
+
+Each run writes its best checkpoint (`recipe_<id>_matched_500k_100ep_tversky_<hash>.pt`) and test metrics (`metrics/test_metrics_r<id>_*.json`) to `results/lgg/slice-random/single/swin/seed_<seed>/`. Already trained recipes are skipped on rerun.
+
+### Step 2: INT4 PTQ figure (recipes 0, 1, 8, 9, 10)
+
+```bash
+python scripts/plot_seed_scatter.py --arch swin --model-size matched_500k \
+  --recipes 0 1 8 9 10 --amp-dtype bf16 --tag int4 \
+  --data-path /data/lgg-mri-segmentation/kaggle_3m
+```
+
+The PTQ recipes are not trained: on first use the script loads each seed's Baseline checkpoint, quantizes it, evaluates it on the test set and caches `test_metrics_r{8,9,10}_*.json` next to the trained recipes. Add `--force-ptq` to re-evaluate. Paired per-seed differences and Wilcoxon p-values are printed to the console.
+
+### Step 3: train NVFP4 Full on all layers (12)
+
+```bash
+python main.py train --arch swin --sizes matched_500k \
+  --dataset lgg --split slice-random \
+  --seeds 2026 2027 2028 2029 2030 2031 2032 2033 2034 2035 \
+  --recipes 12 --epochs 100 --batch-size 16 --amp-dtype bf16 \
+  --data-path /data/lgg-mri-segmentation/kaggle_3m
+```
+
+The model is small, so several seeds can share one GPU, e.g. one process per seed:
+
+```bash
+for s in 2026 2027 2028; do
+  python main.py train --arch swin --sizes matched_500k --dataset lgg --split slice-random \
+    --seeds $s --recipes 12 --epochs 100 --batch-size 16 --amp-dtype bf16 \
+    --data-path /data/lgg-mri-segmentation/kaggle_3m > results/swin500k_r12_seed$s.log 2>&1 &
+done
+wait
+```
+
+### Step 4: all-layers figure (recipes 0, 1, 8, 11, 12)
+
+```bash
+python scripts/plot_seed_scatter.py --arch swin --model-size matched_500k \
+  --recipes 0 1 8 11 12 --amp-dtype bf16 --tag all_layers \
+  --data-path /data/lgg-mri-segmentation/kaggle_3m
+```
+
+Recipe 11 is evaluated and cached from the Baseline checkpoints the same way as recipes 8–10.
+
+For reference, on one RTX 5060 Ti (16 GB) a 100-epoch Swin 500K run takes about 21 min for recipe 1 and 35 min for recipe 12; each PTQ evaluation takes well under a minute per seed.
+
 # Not All NVFP4 QAT Recipes Are Equal
 
 **How Architecture and Scale Shape Model Quality for Anomaly Segmentation**

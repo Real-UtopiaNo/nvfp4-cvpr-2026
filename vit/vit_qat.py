@@ -330,20 +330,64 @@ SUPPORTED_RECIPES = {
         "requires_qat_runtime": True,
         "features": ["rht_wgrad", "forward_only"],
     },
+    13: {
+        "name": "NVFP4 QAT",
+        "description": "Fine-tune the Baseline with NVFP4 fake-quantized forward (X, W), "
+                       "high-precision backward with straight-through estimator",
+        "forward_quantized": True,
+        "backward_quantized": False,
+        "requires_qat_runtime": True,
+    },
 }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PUBLIC NVFP4 QAT RUNTIME COMPATIBILITY
+# NVFP4 QAT RUNTIME (Transformer Engine backend)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_QAT_RUNTIME_AVAILABLE = False
-_QAT_RUNTIME_ADVANCED_AVAILABLE = False
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import NVFP4BlockScaling
+    from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer as _TENVFP4Quantizer
+except ImportError:
+    te = None
+    NVFP4BlockScaling = None
+    _TENVFP4Quantizer = None
+
+_CC_MAJOR = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+
+# NVFP4 GEMMs need Blackwell (SM 10.x / 12.x). RHT and stochastic rounding kernels
+# only run on SM 10.x; on SM 12.x (RTX 50 / RTX PRO 6000) they must be disabled.
+_QAT_RUNTIME_AVAILABLE = te is not None and _CC_MAJOR >= 10
+_QAT_RUNTIME_ADVANCED_AVAILABLE = te is not None and _CC_MAJOR == 10
 _QAT_RUNTIME_QUIET = os.environ.get("QAT_RUNTIME_QUIET", "0") == "1"
 
+# Recipe ID -> NVFP4BlockScaling kwargs (paper Table 2). Fwd-Only (2), Chain Rule (3)
+# and Fwd+RHT (7) change which tensors the backward pass uses and have no TE recipe knob.
+TE_RECIPE_KWARGS = {
+    1: dict(disable_rht=True, disable_stochastic_rounding=True, disable_2d_quantization=True),
+    4: dict(disable_stochastic_rounding=True),
+    5: dict(),
+    6: dict(disable_rht=True, disable_2d_quantization=True),
+}
+BASE_TE_RECIPES = {1}
+# Forward-only fake quantization (TE quantize -> dequantize, high-precision GEMMs).
+FAKE_QUANT_RECIPES = {13}
+
 PUBLIC_QAT_RUNTIME_MESSAGE = (
-    "NVFP4 QAT recipes require a compatible NVFP4 quantization runtime. Vendor-specific runtime integration is intentionally omitted from this public release. Use recipe 0 for baseline training with the provided code."
+    "NVFP4 QAT recipes require Transformer Engine (NVFP4BlockScaling) on a Blackwell GPU. "
+    "Recipes 1 and 13 run on SM 10.x and 12.x; recipes 4-6 need SM 10.x; recipes 2, 3, 7, 8 "
+    "are not implemented with the Transformer Engine backend."
 )
+
+
+def available_qat_recipes() -> set:
+    """Recipe IDs (besides baseline 0) that can run in the current environment."""
+    if not _QAT_RUNTIME_AVAILABLE:
+        return set()
+    if _QAT_RUNTIME_ADVANCED_AVAILABLE:
+        return set(TE_RECIPE_KWARGS) | FAKE_QUANT_RECIPES
+    return BASE_TE_RECIPES | FAKE_QUANT_RECIPES
 
 
 def _qat_runtime_log(msg: str):
@@ -352,9 +396,19 @@ def _qat_runtime_log(msg: str):
         print(msg)
 
 
-def check_qat_runtime_available():
-    """Raise a public-safe error for QAT recipes in this release."""
+def check_qat_runtime_available(recipe_id: Optional[int] = None):
+    """Raise if the requested NVFP4 recipe cannot run in this environment."""
+    if recipe_id is None and _QAT_RUNTIME_AVAILABLE:
+        return
+    if recipe_id is not None and recipe_id in available_qat_recipes():
+        return
     raise RuntimeError(PUBLIC_QAT_RUNTIME_MESSAGE)
+
+
+def _te_autocast(recipe):
+    if hasattr(te, "autocast"):
+        return te.autocast(enabled=True, recipe=recipe)
+    return te.fp8_autocast(enabled=True, fp8_recipe=recipe)
 
 
 def detect_gpu_architecture():
@@ -376,7 +430,7 @@ def check_recipe_hardware_compatibility(recipe_id: int, verbose: bool = True):
     """Report public-release support for the selected recipe."""
     if recipe_id not in SUPPORTED_RECIPES:
         return False
-    if recipe_id == 0:
+    if recipe_id == 0 or recipe_id in available_qat_recipes():
         return True
     if verbose:
         warnings.warn(PUBLIC_QAT_RUNTIME_MESSAGE, RuntimeWarning)
@@ -384,18 +438,23 @@ def check_recipe_hardware_compatibility(recipe_id: int, verbose: bool = True):
 
 
 def can_run_recipe(recipe_id: int) -> Tuple[bool, str]:
-    """Check if a recipe can run in this public release."""
+    """Check if a recipe can run in the current environment."""
     if recipe_id == 0:
         return True, "Baseline recipe"
+    if recipe_id in FAKE_QUANT_RECIPES and recipe_id in available_qat_recipes():
+        return True, "Transformer Engine NVFP4 fake quantization (forward only)"
+    if recipe_id in available_qat_recipes():
+        return True, f"Transformer Engine NVFP4BlockScaling({TE_RECIPE_KWARGS[recipe_id]})"
     return False, PUBLIC_QAT_RUNTIME_MESSAGE
 
 
 class NVFPQuantizer:
     """
-    Public placeholder for NVFP4 QAT integration.
+    NVFP4 QAT configuration for one model, backed by Transformer Engine.
 
-    The paper's recipe metadata is provided for reproducibility context, while
-    vendor/runtime-specific quantization integration is intentionally omitted.
+    Quantized Linear layers are built as ``te.Linear`` (see ``make_linear``) and
+    called inside ``quantizer.autocast()``, which applies the recipe's
+    NVFP4BlockScaling to the forward GEMM and both backward GEMMs.
     """
 
     def __init__(self, recipe_id: int):
@@ -408,43 +467,71 @@ class NVFPQuantizer:
         self.chain_rule = recipe_id == 3
         self.has_rht = recipe_id in [4, 5, 7]
         self.has_sr = recipe_id in [5, 6]
-        self.has_2d_weights = recipe_id in [4, 5, 7]
+        self.has_2d_weights = recipe_id in [4, 5]
         self.uses_autograd = recipe_id == 8
         self.requires_qat_runtime = recipe_id != 0
         self.needs_advanced = recipe_id in [4, 5, 6, 7, 8]
-        self.last_x_mse = None
-        self.last_w_mse = None
-        self.last_g_mse = None
+        self.fake_quant = recipe_id in FAKE_QUANT_RECIPES
+        self.te_recipe = None
 
         if self.enabled:
-            check_qat_runtime_available()
+            check_qat_runtime_available(recipe_id)
+            if not self.fake_quant:
+                self.te_recipe = NVFP4BlockScaling(**TE_RECIPE_KWARGS[recipe_id])
 
-    def quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
-        if self.enabled:
-            check_qat_runtime_available()
-        return x
-
-    def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
-        if self.enabled:
-            check_qat_runtime_available()
-        return w
-
-    def quantize_gradient(self, g: torch.Tensor) -> torch.Tensor:
-        if self.enabled:
-            check_qat_runtime_available()
-        return g
+    def autocast(self):
+        return _te_autocast(self.te_recipe)
 
 
-class QuantizedLinearFunction(torch.autograd.Function):
-    """Public placeholder for the omitted NVFP4 Linear QAT path."""
+_FAKE_QUANT_NVFP4 = None
+
+
+class _NVFP4FakeQuant(torch.autograd.Function):
+    """NVFP4 quantize -> dequantize along the last dim (1x16 blocks, RTN, FP32 result);
+    straight-through estimator in backward."""
 
     @staticmethod
-    def forward(ctx, *args, **kwargs):
-        check_qat_runtime_available()
+    def forward(ctx, t):
+        global _FAKE_QUANT_NVFP4
+        if _FAKE_QUANT_NVFP4 is None:
+            _FAKE_QUANT_NVFP4 = _TENVFP4Quantizer(
+                rowwise=True, columnwise=False, with_rht=False,
+                stochastic_rounding=False, with_2d_quantization=False,
+            )
+        ctx.dtype = t.dtype
+        rows = t.reshape(-1, t.shape[-1])
+        n, k = rows.shape
+        # TE needs both dims to be multiples of 16; zero padding keeps the per-tensor amax.
+        padded = F.pad(rows, (0, -k % 16, 0, -n % 16)).contiguous()
+        out = _FAKE_QUANT_NVFP4.quantize(padded).dequantize().float()[:n, :k]
+        return out.reshape(t.shape)
 
     @staticmethod
-    def backward(ctx, *grad_outputs):
-        check_qat_runtime_available()
+    def backward(ctx, grad):
+        return grad.to(ctx.dtype)
+
+
+def make_linear(in_features: int, out_features: int, bias: bool = True,
+                quantizer: Optional[NVFPQuantizer] = None) -> nn.Module:
+    """``te.Linear`` for TE NVFP4-quantized layers, ``nn.Linear`` otherwise (including
+    fake-quantized ones). Both expose ``weight``/``bias`` so baseline state dicts load into either."""
+    if quantizer is not None and quantizer.te_recipe is not None:
+        return te.Linear(in_features, out_features, bias=bias)
+    return nn.Linear(in_features, out_features, bias=bias)
+
+
+def quantized_linear(x: torch.Tensor, linear: nn.Module, quantizer: NVFPQuantizer) -> torch.Tensor:
+    if quantizer.fake_quant:
+        # Quantizes the same tensors as TE's NVFP4 GEMM (activations in their incoming dtype,
+        # FP32 master weights), multiplied after dequantization in FP32.
+        with torch.autocast("cuda", enabled=False):
+            y = F.linear(_NVFP4FakeQuant.apply(x), _NVFP4FakeQuant.apply(linear.weight),
+                         None if linear.bias is None else linear.bias.float())
+        return y.to(torch.bfloat16)
+    # cuBLAS FP4 GEMMs cannot write FP16 output, so the layer always runs under
+    # BF16 autocast even when the surrounding training loop uses FP16.
+    with torch.autocast("cuda", dtype=torch.bfloat16), quantizer.autocast():
+        return linear(x)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -507,18 +594,17 @@ class MultiHeadSelfAttention(nn.Module):
         self.quantizer = quantizer
         
         # Linear layers (potentially quantized)
-        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.qkv = make_linear(embed_dim, embed_dim * 3, bias=qkv_bias, quantizer=quantizer)
+        self.proj = make_linear(embed_dim, embed_dim, quantizer=quantizer)
         
         self.attn_drop = nn.Dropout(dropout)
         self.proj_drop = nn.Dropout(dropout)
     
-    def _linear(self, x: torch.Tensor, linear: nn.Linear, quantize: bool = True) -> torch.Tensor:
+    def _linear(self, x: torch.Tensor, linear: nn.Module, quantize: bool = True) -> torch.Tensor:
         """Apply Linear - quantized or standard."""
         if self.quantizer is None or not self.quantizer.enabled or not quantize:
             return linear(x)
-        else:
-            return QuantizedLinearFunction.apply(x, linear.weight, linear.bias, self.quantizer)
+        return quantized_linear(x, linear, self.quantizer)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -551,18 +637,17 @@ class MLP(nn.Module):
         hidden_features = int(in_features * mlp_ratio)
         self.quantizer = quantizer
         
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.fc2 = nn.Linear(hidden_features, in_features)
+        self.fc1 = make_linear(in_features, hidden_features, quantizer=quantizer)
+        self.fc2 = make_linear(hidden_features, in_features, quantizer=quantizer)
         self.act = nn.GELU()
         self.drop1 = nn.Dropout(dropout)
         self.drop2 = nn.Dropout(dropout)
     
-    def _linear(self, x: torch.Tensor, linear: nn.Linear, quantize: bool = True) -> torch.Tensor:
+    def _linear(self, x: torch.Tensor, linear: nn.Module, quantize: bool = True) -> torch.Tensor:
         """Apply Linear - quantized or standard."""
         if self.quantizer is None or not self.quantizer.enabled or not quantize:
             return linear(x)
-        else:
-            return QuantizedLinearFunction.apply(x, linear.weight, linear.bias, self.quantizer)
+        return quantized_linear(x, linear, self.quantizer)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._linear(x, self.fc1)
